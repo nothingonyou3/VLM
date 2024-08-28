@@ -10,24 +10,21 @@ import torch.nn.functional as F
 import torchvision
 from torchvision import transforms
 import torchvision.transforms as T
-from torch import optim
+from torch.optim import AdamW
 import open_clip
 import pytorch_lightning as pl
-
+from conch.open_clip_custom import create_model_from_pretrained
 from PIL import Image
 from torchmetrics.functional import auroc
-from torchmetrics.classification import BinaryAccuracy
-from torchmetrics.classification import MulticlassAccuracy
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from conch.open_clip_custom import create_model_from_pretrained
+from conch.open_clip_custom import tokenize, get_tokenizer
 
-class ResNetModel(pl.LightningModule):
-    def __init__(self, num_classes = 4, batch_size = 64, lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001, bbfroze = True):
+
+class CONCH_QuiltTextEncoderModel(pl.LightningModule):
+    def __init__(self, num_classes = 2, batch_size = 64, optim_lr = 0.0001):
         super().__init__()
-        self.num_classes = num_classes      
-        self.lr = lr
-        self.momentum = momentum
-        self.nesterov = nesterov
-        self.weight_decay = weight_decay
+        self.num_classes = num_classes        
+        self.optim_lr = optim_lr
         self.batch_size = batch_size
 
         self.predictions = []
@@ -39,33 +36,30 @@ class ResNetModel(pl.LightningModule):
         self.val_step_trgts = []
         self.train_loss = []
         self.val_loss = []
-        if num_classes == 2:
-            self.metric = BinaryAccuracy()
-        else:
-            self.metric = MulticlassAccuracy(num_classes=num_classes)
 
-        self.resnet50 = models.resnet50(pretrained = True)
-        '''if bbfroze:
-            for param in self.resnet50.parameters():
-                param.requires_grad = False'''
-        self.resnet50.fc = nn.Linear(self.resnet50.fc.in_features, self.num_classes)
+        
+        self.model, self.preprocess = create_model_from_pretrained("conch_ViT-B-16", checkpoint_path="counch_checkpoint/pytorch_model.bin")
+        self.tokenizer = get_tokenizer()
+        self.image_embed_size = 512
+        self.fc = nn.Linear(self.image_embed_size, num_classes)
 
         print("model created")
         print(self.device)
         
 
-    
+    #x as input there should be the text
     def forward(self, x):
-        out = self.resnet50(x)
+        t = x#self.tokenizer(x) #t is the tokenized text
+        x = self.model.encode_text(t.squeeze(1)) #calculating the embeddings of those tokens
+        out = self.fc(x)
         return out
     
     def compute_loss(self, y, yp):
         return F.cross_entropy(y, yp)
 
     def configure_optimizers(self):
-        optimizer = optim.SGD(self.parameters(), lr = self.lr, momentum = self.momentum, nesterov = self.nesterov, weight_decay = self.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max = 12500)
-        return {"optimizer": optimizer}#, "lr_scheduler": scheduler
+        optimizer = AdamW(self.parameters(), lr=self.optim_lr)
+        return optimizer
 
     def process_batch(self, batch):
         img = batch[0].to(self.device)
@@ -91,10 +85,6 @@ class ResNetModel(pl.LightningModule):
         all_trgts = torch.cat(self.train_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('train_auc', auc, batch_size=len(all_preds))
-        if self.num_classes == 2:
-            all_preds = all_preds.max(dim = 1).values
-        acc = self.metric(all_preds, all_trgts)
-        self.log('train_acc', acc, batch_size=len(all_preds))
         self.train_step_preds.clear()
         self.train_step_trgts.clear()
 
@@ -109,10 +99,6 @@ class ResNetModel(pl.LightningModule):
         all_trgts = torch.cat(self.val_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('val_auc', auc, batch_size=len(all_preds))
-        if self.num_classes == 2:
-            all_preds = all_preds.max(dim = 1).values
-        acc = self.metric(all_preds, all_trgts)
-        self.log('val_acc', acc, batch_size=len(all_preds))
         self.val_step_preds.clear()
         self.val_step_trgts.clear()
 
@@ -125,4 +111,3 @@ class ResNetModel(pl.LightningModule):
         self.predictions.append(prd)
         self.targets.append(lab.squeeze())
 
-        

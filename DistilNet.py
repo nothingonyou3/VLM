@@ -13,17 +13,32 @@ import torchvision.transforms as T
 from torch import optim
 import open_clip
 import pytorch_lightning as pl
-
+import timm
 from PIL import Image
 from torchmetrics.functional import auroc
 from torchmetrics.classification import BinaryAccuracy
 from torchmetrics.classification import MulticlassAccuracy
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from Models.UNINetText import UNINetTextModel
 
-class ResNetModel(pl.LightningModule):
-    def __init__(self, num_classes = 4, batch_size = 64, lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001, bbfroze = True):
+def normalize(logit):
+    mean = logit.mean(dim=-1, keepdims=True)
+    stdv = logit.std(dim=-1, keepdims=True)
+    return (logit - mean) / (1e-7 + stdv)
+
+def kd_loss(logits_student_in, logits_teacher_in, temperature, logit_stand):
+    logits_student = normalize(logits_student_in) if logit_stand else logits_student_in
+    logits_teacher = normalize(logits_teacher_in) if logit_stand else logits_teacher_in
+    log_pred_student = F.log_softmax(logits_student / temperature, dim=1)
+    pred_teacher = F.softmax(logits_teacher / temperature, dim=1)
+    loss_kd = F.kl_div(log_pred_student, pred_teacher, reduction="none").sum(1).mean()
+    loss_kd *= temperature**2
+    return loss_kd
+
+class DistilNetModel(pl.LightningModule):
+    def __init__(self, num_classes = 2, batch_size = 64, lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001, bbfroze = True):
         super().__init__()
-        self.num_classes = num_classes      
+        self.num_classes = num_classes        
         self.lr = lr
         self.momentum = momentum
         self.nesterov = nesterov
@@ -44,11 +59,19 @@ class ResNetModel(pl.LightningModule):
         else:
             self.metric = MulticlassAccuracy(num_classes=num_classes)
 
-        self.resnet50 = models.resnet50(pretrained = True)
-        '''if bbfroze:
-            for param in self.resnet50.parameters():
-                param.requires_grad = False'''
-        self.resnet50.fc = nn.Linear(self.resnet50.fc.in_features, self.num_classes)
+        self.teacher_model = UNINetTextModel.load_from_checkpoint("/home/banafsh7/projects/def-hadi87/7/output/UNI_pcam_text_v12_with_residual_TE_frozen_att_dropout_0_1_nofc0/version_0/checkpoints/epoch=5-step=24576.ckpt", num_classes = 2)
+        self.teacher_model = self.teacher_model.eval()
+        self.model = timm.create_model("hf-hub:MahmoodLab/uni", pretrained=True, init_values=1e-5, dynamic_img_size=True)
+        if bbfroze:
+            for param in self.model.parameters():
+                param.requires_grad = False
+        self.image_embed_size = 1024
+        self.fc = nn.Linear(self.image_embed_size, num_classes)
+
+        '''self.text_embed_size = 512
+        self.model.blocks[-1].mlp.fc2 = nn.Linear(in_features=4096, out_features=self.text_embed_size, bias=True)
+        self.model.norm = nn.LayerNorm((512,), eps=1e-06, elementwise_affine=True)
+        self.fc = nn.Linear(self.text_embed_size, num_classes)'''
 
         print("model created")
         print(self.device)
@@ -56,7 +79,8 @@ class ResNetModel(pl.LightningModule):
 
     
     def forward(self, x):
-        out = self.resnet50(x)
+        x = self.model(x)
+        out = self.fc(x)
         return out
     
     def compute_loss(self, y, yp):
@@ -65,14 +89,16 @@ class ResNetModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = optim.SGD(self.parameters(), lr = self.lr, momentum = self.momentum, nesterov = self.nesterov, weight_decay = self.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max = 12500)
-        return {"optimizer": optimizer}#, "lr_scheduler": scheduler
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def process_batch(self, batch):
-        img = batch[0].to(self.device)
-        lab = batch[1].to(self.device)
+        img, txt, lab = batch
+        img = img.squeeze(1).to(self.device)
+        txt = torch.tensor(txt).to(self.device)
         out = self.forward(img)
+        out_t = self.teacher_model.forward(img, txt)
         prd = torch.softmax(out, dim=1)
-        loss = self.compute_loss(prd, lab)
+        loss = self.compute_loss(prd, lab) + kd_loss(out, out_t, 2, True)
         return loss, prd, lab
 
     def training_step(self, batch, batch_idx):
@@ -90,10 +116,8 @@ class ResNetModel(pl.LightningModule):
         all_preds = torch.cat(self.train_step_preds, dim=0)
         all_trgts = torch.cat(self.train_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
+        acc = self.metric(all_preds.argmax(1), all_trgts)
         self.log('train_auc', auc, batch_size=len(all_preds))
-        if self.num_classes == 2:
-            all_preds = all_preds.max(dim = 1).values
-        acc = self.metric(all_preds, all_trgts)
         self.log('train_acc', acc, batch_size=len(all_preds))
         self.train_step_preds.clear()
         self.train_step_trgts.clear()
@@ -109,9 +133,7 @@ class ResNetModel(pl.LightningModule):
         all_trgts = torch.cat(self.val_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('val_auc', auc, batch_size=len(all_preds))
-        if self.num_classes == 2:
-            all_preds = all_preds.max(dim = 1).values
-        acc = self.metric(all_preds, all_trgts)
+        acc = self.metric(all_preds.argmax(1), all_trgts)
         self.log('val_acc', acc, batch_size=len(all_preds))
         self.val_step_preds.clear()
         self.val_step_trgts.clear()

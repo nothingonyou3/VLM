@@ -16,12 +16,18 @@ import pytorch_lightning as pl
 import open_clip
 from PIL import Image
 from torchmetrics.functional import auroc
+from torchmetrics.classification import BinaryAccuracy
+from torchmetrics.classification import MulticlassAccuracy
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 class ResNetTextModel(pl.LightningModule):
-    def __init__(self, num_classes = 2, batch_size = 64, optim_lr = 0.0001):
+    def __init__(self, num_classes = 2, batch_size = 64, lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001, bbfroze = True):
         super().__init__()
         self.num_classes = num_classes        
-        self.optim_lr = optim_lr
+        self.lr = lr
+        self.momentum = momentum
+        self.nesterov = nesterov
+        self.weight_decay = weight_decay
         self.batch_size = batch_size
 
         self.predictions = []
@@ -34,10 +40,24 @@ class ResNetTextModel(pl.LightningModule):
         self.train_loss = []
         self.val_loss = []
 
+        if num_classes == 2:
+            self.metric = BinaryAccuracy()
+        else:
+            self.metric = MulticlassAccuracy(num_classes=num_classes)
+
         self.resnet50 = models.resnet50(pretrained = True)
+        self.model, self.preprocess_train, self.preprocess_val = open_clip.create_model_and_transforms('hf-hub:wisdomik/QuiltNet-B-32')
+        '''if bbfroze:
+            for param in self.resnet50.parameters():
+                param.requires_grad = False'''
+        if True:
+            for param in self.model.parameters():
+                param.requires_grad = False
+
         self.model, self.preprocess_train, self.preprocess_val = open_clip.create_model_and_transforms('hf-hub:wisdomik/QuiltNet-B-32')
         self.text_embed_size = 512
         self.resnet50.fc = nn.Linear(self.resnet50.fc.in_features, self.text_embed_size)
+        self.fc0 = nn.Linear(self.text_embed_size, self.text_embed_size)
         self.fc = nn.Linear(self.text_embed_size, self.num_classes)# + self.text_embed_size
         self.multihead_attn = nn.MultiheadAttention(self.text_embed_size, 1)
 
@@ -46,12 +66,16 @@ class ResNetTextModel(pl.LightningModule):
         
 
     
-    def forward(self, x, text_inputs):
+    def forward(self, x, text_inputs, residual = True):
         text_embeds = self.model.encode_text(text_inputs.squeeze(1))
         image_embeds = self.resnet50(x)
         attn_output, attn_output_weights = self.multihead_attn(image_embeds, text_embeds, text_embeds)#query, key, value
         #x = torch.cat((image_embeds, text_embeds), 1)
-        x = attn_output
+        if residual:
+            x = attn_output#self.fc0(attn_output)
+            x = x + image_embeds
+        else:
+            x = attn_output
         out = self.fc(x)
         return out
     
@@ -59,8 +83,9 @@ class ResNetTextModel(pl.LightningModule):
         return F.cross_entropy(y, yp)
 
     def configure_optimizers(self):
-        optimizer = optim.SGD(self.parameters(), lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001)
-        return optimizer
+        optimizer = optim.SGD(self.parameters(), lr = self.lr, momentum = self.momentum, nesterov = self.nesterov, weight_decay = self.weight_decay)
+        #scheduler = CosineAnnealingLR(optimizer, T_max = 12500)
+        return {"optimizer": optimizer}#, "lr_scheduler": scheduler
 
     def process_batch(self, batch):
         img, txt, lab = batch
@@ -88,6 +113,10 @@ class ResNetTextModel(pl.LightningModule):
         all_trgts = torch.cat(self.train_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('train_auc', auc, batch_size=len(all_preds))
+        if self.num_classes == 2:
+            all_preds = all_preds.max(dim = 1).values
+        acc = self.metric(all_preds, all_trgts)
+        self.log('train_acc', acc, batch_size=len(all_preds))
         self.train_step_preds.clear()
         self.train_step_trgts.clear()
 
@@ -102,6 +131,10 @@ class ResNetTextModel(pl.LightningModule):
         all_trgts = torch.cat(self.val_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('val_auc', auc, batch_size=len(all_preds))
+        if self.num_classes == 2:
+            all_preds = all_preds.max(dim = 1).values
+        acc = self.metric(all_preds, all_trgts)
+        self.log('val_acc', acc, batch_size=len(all_preds))
         self.val_step_preds.clear()
         self.val_step_trgts.clear()
 

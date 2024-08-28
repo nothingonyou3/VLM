@@ -13,17 +13,18 @@ import torchvision.transforms as T
 from torch import optim
 import open_clip
 import pytorch_lightning as pl
-
+import open_clip
 from PIL import Image
 from torchmetrics.functional import auroc
+import timm
 from torchmetrics.classification import BinaryAccuracy
 from torchmetrics.classification import MulticlassAccuracy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-class ResNetModel(pl.LightningModule):
-    def __init__(self, num_classes = 4, batch_size = 64, lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001, bbfroze = True):
+class VITBNetTextModel(pl.LightningModule):
+    def __init__(self, num_classes = 4, batch_size = 64, lr=0.001, momentum=0.9, nesterov = True, weight_decay = 0.0001, bbfroze = True, modeltype = "vitb8"):
         super().__init__()
-        self.num_classes = num_classes      
+        self.num_classes = num_classes        
         self.lr = lr
         self.momentum = momentum
         self.nesterov = nesterov
@@ -39,24 +40,47 @@ class ResNetModel(pl.LightningModule):
         self.val_step_trgts = []
         self.train_loss = []
         self.val_loss = []
+
         if num_classes == 2:
             self.metric = BinaryAccuracy()
         else:
             self.metric = MulticlassAccuracy(num_classes=num_classes)
 
-        self.resnet50 = models.resnet50(pretrained = True)
-        '''if bbfroze:
-            for param in self.resnet50.parameters():
-                param.requires_grad = False'''
-        self.resnet50.fc = nn.Linear(self.resnet50.fc.in_features, self.num_classes)
+        self.model, self.preprocess_train, self.preprocess_val = open_clip.create_model_and_transforms('hf-hub:wisdomik/QuiltNet-B-32')
+        if modeltype == "vitb16":
+            self.model_image = torch.hub.load("kaiko-ai/towards_large_pathology_fms", "vitb16", trust_repo=True)
+        else:
+            self.model_image = torch.hub.load("kaiko-ai/towards_large_pathology_fms", "vitb8", trust_repo=True)
+        if bbfroze:
+            for param in self.model_image.parameters():
+                param.requires_grad = False
+        if True:
+            for param in self.model.parameters():
+                param.requires_grad = False
+        self.text_embed_size = 512
+        self.image_embed_size = 768
+        #self.fc0 = nn.Linear(self.text_embed_size, self.image_embed_size)
+        #self.fc0 = nn.Linear(self.image_embed_size, self.image_embed_size)
+        self.fc = nn.Linear(self.image_embed_size, num_classes)
+        self.multihead_attn = nn.MultiheadAttention(embed_dim = self.image_embed_size, kdim = 512, vdim = 512, num_heads=1, dropout = 0.1)#nn.MultiheadAttention(self.image_embed_size, 1)
 
         print("model created")
         print(self.device)
         
 
     
-    def forward(self, x):
-        out = self.resnet50(x)
+    def forward(self, x, text_inputs, residual = True):
+        text_embeds = self.model.encode_text(text_inputs.squeeze(1))
+        image_embeds = self.model_image(x)
+        #print(image_embeds.shape, text_embeds.shape)
+        attn_output, attn_output_weights = self.multihead_attn(image_embeds, text_embeds, text_embeds)#query, key, value
+        #x = torch.cat((image_embeds, text_embeds), 1)
+        if residual:
+            x = attn_output#self.fc0(attn_output)
+            x = x + image_embeds
+        else:
+            x = attn_output
+        out = self.fc(x)
         return out
     
     def compute_loss(self, y, yp):
@@ -64,13 +88,16 @@ class ResNetModel(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.SGD(self.parameters(), lr = self.lr, momentum = self.momentum, nesterov = self.nesterov, weight_decay = self.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max = 12500)
+        #optimizer = optim.Adam(self.parameters(), lr = self.lr, weight_decay = self.weight_decay)
+        #scheduler = CosineAnnealingLR(optimizer, T_max = 12500, eta_min = 0.000001)
         return {"optimizer": optimizer}#, "lr_scheduler": scheduler
 
     def process_batch(self, batch):
-        img = batch[0].to(self.device)
-        lab = batch[1].to(self.device)
-        out = self.forward(img)
+        img, txt, lab = batch
+        img = img.squeeze(1).to(self.device)
+        txt = torch.tensor(txt).to(self.device)
+        lab = lab.to(self.device)
+        out = self.forward(img, txt)
         prd = torch.softmax(out, dim=1)
         loss = self.compute_loss(prd, lab)
         return loss, prd, lab
@@ -91,9 +118,7 @@ class ResNetModel(pl.LightningModule):
         all_trgts = torch.cat(self.train_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('train_auc', auc, batch_size=len(all_preds))
-        if self.num_classes == 2:
-            all_preds = all_preds.max(dim = 1).values
-        acc = self.metric(all_preds, all_trgts)
+        acc = self.metric(all_preds.argmax(1), all_trgts)
         self.log('train_acc', acc, batch_size=len(all_preds))
         self.train_step_preds.clear()
         self.train_step_trgts.clear()
@@ -109,9 +134,7 @@ class ResNetModel(pl.LightningModule):
         all_trgts = torch.cat(self.val_step_trgts, dim=0)
         auc = auroc(all_preds, all_trgts, num_classes=self.num_classes, average='macro', task='multiclass')
         self.log('val_auc', auc, batch_size=len(all_preds))
-        if self.num_classes == 2:
-            all_preds = all_preds.max(dim = 1).values
-        acc = self.metric(all_preds, all_trgts)
+        acc = self.metric(all_preds.argmax(1), all_trgts)
         self.log('val_acc', acc, batch_size=len(all_preds))
         self.val_step_preds.clear()
         self.val_step_trgts.clear()
